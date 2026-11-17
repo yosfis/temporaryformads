@@ -11,3 +11,4 @@ _backups/
 Thumbs.db
 .pytest_cache/
 data/ventureos.db
+.env.example
