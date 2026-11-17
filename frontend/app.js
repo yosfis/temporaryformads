@@ -25,6 +25,7 @@ function clearState() {
   state.ventureId = null;
   state.analyzedCache = null;
   state.askHistory = [];
+  state.mapAutoTried = false;
 }
 
 /* ── Start over ──────────────────────────────────────────────────── */
@@ -166,6 +167,75 @@ function formatStatus(s) {
   return map[s] || s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/* ── Plain-English helpers ───────────────────────────────────────────── */
+const DECISION_TEXT = { GO: "Go ahead", REPEAT: "Repeat this stage", PIVOT: "Pivot", STOP: "Stop",
+                        APPROVED: "Approved by you", REJECTED: "Rejected by you" };
+const AGENT_NAMES = { founder: "You (founder)", founder_understanding: "Founder interview",
+  feasibility: "Feasibility analyst", validation: "Validation analyst", development: "Prototype builder",
+  testing: "Prototype tester", strategy: "Product strategist", financial: "Financial analyst",
+  commercial: "Pricing analyst", marketing: "Marketing writer", operations: "Operations planner",
+  research: "Market researcher", case_research: "Case researcher", business_map: "Business mapper" };
+function humanize(s) {
+  s = String(s ?? "");
+  if (s.includes("://")) return s;
+  return s.replace(/\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b/g, (m) => m.replace(/_/g, " "));
+}
+function sentenceCase(s) { s = humanize(s).trim(); return s.charAt(0).toUpperCase() + s.slice(1); }
+function stageLabel(s) { return (state.config && state.config.stage_labels[s]) || sentenceCase(s); }
+function decisionBadge(code, text) {
+  const c = String(code || "").toUpperCase();
+  return `<span class="decision-badge d-${escapeHtml(c.toLowerCase())}">${escapeHtml(text || DECISION_TEXT[c] || sentenceCase(c))}</span>`;
+}
+function renderReport(r, compact) {
+  if (!r) return "";
+  const hl = (r.highlights || []).map((h) =>
+    `<div class="hl"><div class="hl-k">${escapeHtml(h.label)}</div><div class="hl-v">${escapeHtml(h.value)}</div></div>`).join("");
+  const secs = (r.sections || []).map((sec) =>
+    `<details class="report-sec"${compact ? "" : " open"}><summary>${escapeHtml(sec.title)} <span class="muted">(${sec.items.length})</span></summary>
+     <ul>${sec.items.map((i) => `<li>${escapeHtml(i)}</li>`).join("")}</ul></details>`).join("");
+  const links = (r.links || []).map((l) => l.url.startsWith("#")
+    ? `<button class="primary" data-goto="${escapeHtml(l.url.slice(1))}">${escapeHtml(l.label)}</button>`
+    : `<a class="report-link" href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.label)} ↗</a>`).join("");
+  return `<div class="card report-card">
+    <div class="report-head"><h3>${escapeHtml(r.stage_label)} — summary</h3>${decisionBadge(r.decision, r.decision_text)}</div>
+    <p class="report-summary">${escapeHtml(r.summary)}</p>
+    ${hl ? `<div class="hl-grid">${hl}</div>` : ""}
+    ${links ? `<div class="report-links">${links}</div>` : ""}
+    ${secs}
+  </div>`;
+}
+function bindReportLinks(root) {
+  root.querySelectorAll("[data-goto]").forEach((b) => { b.onclick = () => switchPanel(b.dataset.goto); });
+}
+
+/* ── Rename project ─────────────────────────────────────────────────── */
+function beginRename() {
+  const el = $("#venture-name");
+  if (!el || el.querySelector("input") || !state.ventureId) return;
+  const current = el.textContent.trim();
+  el.innerHTML = `<input class="rename-input" maxlength="80" value="${escapeHtml(current)}" aria-label="Project name">`;
+  const inp = el.querySelector("input");
+  inp.focus(); inp.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return; done = true;
+    const name = inp.value.trim();
+    if (save && name && name !== current) {
+      try {
+        await api(`/api/ventures/${state.ventureId}/rename`, { method: "POST", body: JSON.stringify({ name }) });
+        el.textContent = name; toastOk("Renamed");
+        return;
+      } catch (e) { toastError("Rename failed: " + e.message); }
+    }
+    el.textContent = current;
+  };
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    if (e.key === "Escape") finish(false);
+  });
+  inp.addEventListener("blur", () => finish(true));
+}
+
 const THEME_PRESETS = {
   midnight: { accent: "#6366f1", accent_2: "#a855f7", bg: "#07070f", surface: "#0f0f1a" },
   aurora:   { accent: "#14b8a6", accent_2: "#8b5cf6", bg: "#060d0d", surface: "#0c1618" },
@@ -289,6 +359,11 @@ async function bootstrap() {
       clearState();
     }
   }
+}
+
+{
+  const vn = $("#venture-name");
+  if (vn) { vn.title = "Click to rename"; vn.classList.add("renamable"); vn.addEventListener("click", beginRename); }
 }
 
 $$(".chip").forEach((c) => c.addEventListener("click", () => {
@@ -546,7 +621,7 @@ async function refresh() {
   ]);
   if (analyzedResp && analyzedResp.analyzed) state.analyzedCache = analyzedResp.analyzed;
 
-  $("#venture-name").textContent = data.venture.name;
+  if (!$("#venture-name").querySelector("input")) $("#venture-name").textContent = data.venture.name;
   applyVenturePalette(data.venture.brief && data.venture.brief.theme, data.venture.theme);
 
   // Stage list
@@ -562,27 +637,51 @@ async function refresh() {
 
   const currentStage = data.venture.current_stage;
   const currentStatus = ((data.stages[currentStage] || {}).status) || "not_started";
-  const runnable = currentStatus === "not_started" || currentStatus === "awaiting_input";
-  const runLabel = runnable ? "Run current stage"
+  const stagesAll = state.config.stages;
+  const allDone = currentStage === stagesAll[stagesAll.length - 1] && currentStatus === "completed";
+  const runnable = ["not_started", "awaiting_input", "stopped"].includes(currentStatus);
+  const runLabel = allDone ? "All six stages complete"
+    : currentStatus === "stopped" ? "Re-run stage (after pivoting)"
+    : currentStatus === "awaiting_input" ? "Run stage again"
+    : runnable ? "Run current stage"
     : currentStatus === "in_progress" ? "Stage running…"
     : currentStatus === "awaiting_approval" ? "Awaiting your approval below"
-    : currentStatus === "completed" ? "Stage completed — approve to advance"
-    : currentStatus === "stopped" ? "Stage stopped — pivot or reject"
+    : currentStatus === "completed" ? "Stage completed"
     : "Not runnable";
 
   const warn = data.venture.gate === "STOP"
-    ? `<div style="margin-top:12px;padding:12px;border-radius:10px;background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.35);line-height:1.5"><strong>⚠️ Stop recommended.</strong> The agents found this venture not feasible as described. Review the rationale below, then pivot or reject.</div>`
+    ? `<div style="margin-top:12px;padding:12px;border-radius:10px;background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.35);line-height:1.5"><strong>⚠️ Stop recommended.</strong> The agents found this venture not feasible as described. Review the summary below — approve to continue anyway, or reject and re-run after adjusting the idea.</div>`
     : "";
+  const vid = state.ventureId;
+  const doneBanner = allDone ? `<div class="done-banner"><strong>🎉 Your venture plan is complete.</strong>
+      <div class="report-links" style="margin-top:10px">
+        <a class="report-link" href="/api/ventures/${vid}/artifacts/report" target="_blank" rel="noopener">Full venture report ↗</a>
+        <a class="report-link" href="/api/ventures/${vid}/artifacts/prototype" target="_blank" rel="noopener">Prototype ↗</a>
+        <a class="report-link" href="/api/ventures/${vid}/artifacts/validation-plan" target="_blank" rel="noopener">Validation plan ↗</a>
+        <button class="ghost" data-goto="mindmap">Business mind map</button>
+      </div></div>` : "";
   $("#overview-content").innerHTML = `
     <div style="line-height:1.6"><strong>Idea:</strong> ${escapeHtml(data.venture.idea)}</div>
     <div style="margin-top:8px"><strong>Stage:</strong> ${state.config.stage_labels[currentStage]}</div>
-    <div style="margin-top:8px;white-space:normal;word-wrap:break-word"><strong>Decision:</strong> ${escapeHtml(data.venture.gate || "—")}</div>
-    <div style="margin-top:6px;white-space:normal;word-wrap:break-word;color:var(--muted)">${escapeHtml(data.venture.gate_rationale || "")}</div>
-    ${warn}
+    <div style="margin-top:8px"><strong>Latest decision:</strong> ${data.venture.gate && data.venture.gate !== "pending" ? decisionBadge(data.venture.gate) : "None yet"}</div>
+    ${warn}${doneBanner}
     <button id="run-current" class="primary${currentStatus === "in_progress" ? " running" : ""}" style="margin-top:14px"${runnable ? "" : " disabled"}>${escapeHtml(runLabel)}</button>
     ${currentStatus === "in_progress" ? '<div id="run-eta" class="run-eta"></div>' : ""}
     <div id="stage-feedback" style="margin-top:14px"></div>`;
   if (runnable) $("#run-current").onclick = runStage;
+
+  // Stage reports: current stage first, then earlier ones (collapsed)
+  const reportOf = (s) => ((data.stages[s] || {}).notes || {}).report;
+  const fbBox = $("#stage-feedback");
+  if (currentStatus !== "in_progress" && reportOf(currentStage)) fbBox.innerHTML = renderReport(reportOf(currentStage));
+  const earlier = stagesAll.filter((s) => s !== currentStage && reportOf(s)).reverse();
+  if (earlier.length) {
+    fbBox.insertAdjacentHTML("beforeend", `<div class="earlier-reports"><h4>Earlier stages</h4>${earlier.map((s) => {
+      const r = reportOf(s);
+      return `<details class="earlier"><summary>${escapeHtml(r.stage_label)} ${decisionBadge(r.decision, r.decision_text)}</summary>${renderReport(r, true)}</details>`;
+    }).join("")}</div>`);
+  }
+  bindReportLinks($("#overview-content"));
 
   // Polling + ETA for in-progress stages (survives refresh)
   if (currentStatus === "in_progress") {
@@ -638,18 +737,18 @@ async function refresh() {
       d.className = "card";
       const sources = (a.payload.sources_used || []);
       d.innerHTML = `
-        <div style="font-weight:600;margin-bottom:6px">Decision: ${escapeHtml(a.payload.recommendation || "—")}</div>
-        <div style="color:var(--muted);line-height:1.6;white-space:normal;word-wrap:break-word">${escapeHtml(a.payload.rationale || "No rationale.")}</div>
-        ${a.payload.classification ? `<div style="margin-top:8px;font-size:13px;color:var(--muted)">Classification: ${escapeHtml(a.payload.classification)}</div>` : ""}
+        <div style="font-weight:600;margin-bottom:8px">${escapeHtml(a.payload.stage_label || sentenceCase(String(a.action || "").replace(/_gate$/, "")))} decision: ${decisionBadge(a.payload.recommendation, a.payload.decision_text)}</div>
+        <div style="color:var(--muted);line-height:1.6;white-space:normal;word-wrap:break-word">${escapeHtml(humanize(a.payload.rationale || "No rationale."))}</div>
+        ${a.payload.classification ? `<div style="margin-top:8px;font-size:13px;color:var(--muted)">Result: ${escapeHtml(sentenceCase(String(a.payload.classification).toLowerCase()))}</div>` : ""}
         ${sources.length > 0 ? `<div class="approval-source-list"><div class="label">Sources used</div>${sources.map((s) => `<div><a href="${escapeHtml(s)}" target="_blank" rel="noopener">${escapeHtml(s)}</a></div>`).join("")}</div>` : ""}
         ${(a.payload.unsupported_claims || []).length > 0 ? `<div style="margin-top:12px;padding:10px;border-radius:8px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:13px"><strong>⚠️ Unsupported claims:</strong><ul style="margin:6px 0 0 16px;padding:0">${(a.payload.unsupported_claims || []).map((c) => `<li>${escapeHtml(c)}</li>`).join("")}</ul></div>` : ""}
         <div style="margin-top:12px;display:flex;gap:8px">
-          <button class="primary" data-approve="${a.id}">Approve & Advance</button>
+          <button class="primary" data-approve="${a.id}">${currentStage === stagesAll[stagesAll.length - 1] ? "Approve & finish" : "Approve & continue"}</button>
           <button class="ghost" data-reject="${a.id}">Reject</button>
         </div>`;
       d.querySelector("[data-approve]").onclick = async () => {
-        try { await api("/api/approve", { method: "POST", body: JSON.stringify({ venture_id: state.ventureId, approval_id: a.id }) });
-          toastOk("Approved"); await refresh();
+        try { const r = await api("/api/approve", { method: "POST", body: JSON.stringify({ venture_id: state.ventureId, approval_id: a.id }) });
+          toastOk(r.finished ? "Venture plan complete 🎉" : "Approved — next: " + stageLabel(r.advanced_to)); await refresh();
         } catch (e) { toastError(e.message); }
       };
       d.querySelector("[data-reject]").onclick = async () => {
@@ -668,7 +767,9 @@ async function refresh() {
     const st = data.stages[s] || { status: "not_started" };
     const c = document.createElement("div");
     c.className = "stage-card";
-    c.innerHTML = `<h3>${state.config.stage_labels[s]}</h3><span class="status-tag">${formatStatus(st.status)}</span>`;
+    const r = (st.notes || {}).report;
+    c.innerHTML = `<h3>${state.config.stage_labels[s]}</h3><span class="status-tag">${formatStatus(st.status)}</span>
+      ${r ? `<div style="margin-top:10px">${decisionBadge(r.decision, r.decision_text)}</div><p class="muted" style="line-height:1.55;margin:8px 0 0">${escapeHtml(r.summary)}</p>` : ""}`;
     cards.appendChild(c);
   }
 
@@ -746,8 +847,10 @@ async function runStage() {
   startETA(stage);
   startPoll(stage);
 
+  state.stageRequestActive = true;
   try {
     const res = await api(`/api/ventures/${state.ventureId}/run-stage/${stage}`, { method: "POST" });
+    state.stageRequestActive = false;
     stopPoll();
     stopETA();
     if (res.status === "not_implemented" || res.status === "wrong_stage" || res.status === "already_ran") {
@@ -755,17 +858,14 @@ async function runStage() {
       btn.classList.remove("running");
       btn.disabled = false; btn.textContent = "Run current stage"; return;
     }
-    renderFeedback(res, stage);
     await refresh();
-    renderFeedback(res, stage);
-    if (res.stage_status === "stopped" || res.warning) {
-      toastError(res.warning || "Stage stopped.");
-    } else {
-      toastOk("Done: " + stage);
-    }
+    if (res.stage_status === "stopped") toastError("Stop recommended — see the summary.");
+    else toastOk(stageLabel(stage) + " finished — decision ready");
   } catch (e) {
+    state.stageRequestActive = false;
     stopPoll(); stopETA();
     toastError("Stage failed: " + e.message);
+    await refresh();
     btn.classList.remove("running");
     btn.disabled = false; btn.textContent = "Run current stage";
   }
@@ -802,6 +902,9 @@ function startPoll(stage) {
       const st = data.stages[stage] || {};
       const cps = (st.notes && st.notes.checkpoints) || [];
       renderCheckpoints(stage, cps, st.status);
+      if (st.status && st.status !== "in_progress" && !state.stageRequestActive) {
+        stopPoll(); stopETA(); await refresh();
+      }
     } catch (e) {}
   };
   tick();
@@ -821,7 +924,7 @@ function renderCheckpoints(stage, cps, status) {
     panel.className = "checkpoint-panel";
     panel.dataset.stage = stage;
     panel.dataset.rendered = "0";
-    panel.innerHTML = `<h4>${stage.charAt(0).toUpperCase() + stage.slice(1)} — live</h4><div class="checkpoint-list"></div>`;
+    panel.innerHTML = `<h4>${escapeHtml(stageLabel(stage))} — live</h4><div class="checkpoint-list"></div>`;
     box.appendChild(panel);
   }
   const list = panel.querySelector(".checkpoint-list");
@@ -901,36 +1004,6 @@ function showModalHtml(html, title) {
   document.addEventListener("keydown", esc);
 }
 
-function renderFeedback(res, stage) {
-  const box = $("#stage-feedback");
-  if (!box) return;
-  box.querySelectorAll(".feedback-card").forEach((el) => el.remove());
-  const fb = res.feedback || {};
-  let html = `<div class="card feedback-card" style="animation:fadeUp .4s ease;margin-top:14px"><h3 style="margin-top:0">Summary — ${escapeHtml(stage)}</h3>`;
-  if (fb.sources_found !== undefined) {
-    html += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)"><span>Sources found</span><span style="font-weight:700;color:var(--accent-3)">${fb.sources_found}</span></div>`;
-    html += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)"><span>Findings</span><span style="font-weight:700;color:var(--accent-3)">${fb.findings_extracted}</span></div>`;
-  }
-  if (fb.dimensions && Object.keys(fb.dimensions).length > 0) {
-    html += `<div style="margin-top:14px"><strong>Feasibility</strong>`;
-    for (const [d, v] of Object.entries(fb.dimensions)) {
-      html += `<div style="display:grid;grid-template-columns:120px 70px 1fr;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px"><span>${escapeHtml(d)}</span><span style="font-size:11px;font-weight:700;text-transform:uppercase;text-align:center;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.06)">${escapeHtml(v.score || "?")}</span><span style="color:var(--muted)">${escapeHtml(v.reason || "")}</span></div>`;
-    }
-    html += `</div>`;
-  }
-  if (fb.next_steps && fb.next_steps.length > 0) {
-    html += `<div style="margin-top:14px"><strong>Next steps</strong><ol style="margin:6px 0 0 20px;padding:0;line-height:1.7">${fb.next_steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>`;
-  }
-  if (fb.risks && fb.risks.length > 0) {
-    html += `<div style="margin-top:14px"><strong>Risks</strong><ul style="margin:6px 0 0 20px;padding:0;line-height:1.7">${fb.risks.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul></div>`;
-  }
-  if (fb.features_generated !== undefined) html += `<div style="margin-top:14px">Features: <strong>${fb.features_generated}</strong> · Files: <strong>${fb.files_written}</strong> · Tests: <strong>${fb.tests_passed ? "passed" : "failed"}</strong></div>`;
-  if (fb.gross_margin_pct !== undefined) html += `<div style="margin-top:14px">Margin: <strong>${fb.gross_margin_pct}%</strong> · Break-even: <strong>${fb.break_even_units || "N/A"}</strong></div>`;
-  if (fb.claims_total !== undefined) html += `<div style="margin-top:14px">Claims: <strong>${fb.claims_total}</strong> · Unsupported: <strong style="color:#ef4444">${fb.claims_unsupported}</strong></div>`;
-  html += `</div>`;
-  box.insertAdjacentHTML("beforeend", html);
-}
-
 $$(".sidebar nav a").forEach((a) => a.addEventListener("click", async () => {
   $$(".sidebar nav a").forEach((x) => x.classList.remove("active"));
   a.classList.add("active");
@@ -962,9 +1035,9 @@ async function renderDecisions() {
     const badge = d.approval_status === "approved" ? '<span class="badge approved">approved</span>'
                 : d.approval_status === "rejected" ? '<span class="badge rejected">rejected</span>' : "";
     card.innerHTML = `
-      <div class="head"><div class="action">${escapeHtml(d.action || "decision")}${badge}</div><div class="meta">${escapeHtml(time)}</div></div>
-      <div><span class="badge stage">${escapeHtml(d.stage || "?")}</span><span class="badge model">${escapeHtml(d.model || "unknown")}</span>${d.agent ? `<span class="badge stage">${escapeHtml(d.agent)}</span>` : ""}</div>
-      <div class="rationale"><strong>Decision:</strong> ${escapeHtml(d.decision || "—")}<br>${escapeHtml(d.rationale || "")}</div>`;
+      <div class="head"><div class="action">${escapeHtml(sentenceCase(d.action || "Decision"))}${badge}</div><div class="meta">${escapeHtml(time)}</div></div>
+      <div><span class="badge stage">${escapeHtml(stageLabel(d.stage || ""))}</span><span class="badge model">${escapeHtml(d.model || "unknown")}</span>${d.agent ? `<span class="badge stage">${escapeHtml(AGENT_NAMES[d.agent] || sentenceCase(d.agent))}</span>` : ""}</div>
+      <div class="rationale"><strong>Decision:</strong> ${decisionBadge(d.decision)}<br>${escapeHtml(humanize(d.rationale || ""))}</div>`;
     box.appendChild(card);
   }
 }
@@ -983,6 +1056,7 @@ async function renderMindMap() {
       ${data.can_generate ? '<div style="margin-top:14px"><button class="primary" id="gen-map">Generate business map</button></div>' : ""}
     </div>`;
     const gb = document.getElementById("gen-map");
+    if (gb && !state.mapAutoTried) { state.mapAutoTried = true; setTimeout(() => gb.click(), 0); }
     if (gb) gb.onclick = async () => {
       gb.disabled = true; gb.textContent = "Generating…";
       try { await api(`/api/ventures/${state.ventureId}/mindmap/generate`, { method: "POST" }); await renderMindMap(); }

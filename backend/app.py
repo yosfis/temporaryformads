@@ -7,9 +7,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import approval_manager, mindmap
-from backend.orchestrator import Orchestrator
+from backend.orchestrator import ARTIFACTS, Orchestrator, recover_interrupted_stages
 from agents.founder_agent import REQUIRED_FIELDS, normalize_state
-from config import FRONTEND_DIR, STAGE_LABELS, STAGES, THEME_BY_CATEGORY
+from config import FRONTEND_DIR, OUTPUTS_DIR, STAGE_LABELS, STAGES, THEME_BY_CATEGORY
 from memory import database
 from services import decision_log, evidence_ledger
 from tools.ollama_client import OllamaError, get_client
@@ -23,6 +23,7 @@ _analyze_cache: dict[str, dict] = {}
 def _startup():
     import os as _os
     provider = _os.getenv("MODEL_PROVIDER", "ollama").lower().strip()
+    recover_interrupted_stages()
     print("=" * 60)
     print("[VentureOS] Startup provider=" + provider)
     try:
@@ -58,6 +59,9 @@ class ThemePayload(BaseModel):
 class AskRequest(BaseModel):
     question: str
     history: list[dict] = []
+
+class RenameRequest(BaseModel):
+    name: str
 
 class UpdateFieldRequest(BaseModel):
     field: str
@@ -108,6 +112,40 @@ def get_venture(vid: str):
             "evidence": evidence_ledger.list_for(vid),
             "evidence_summary": evidence_ledger.summary(vid),
             "approvals": approval_manager.list_pending(vid)}
+
+
+@app.post("/api/ventures/{vid}/rename")
+def rename_venture(vid: str, body: RenameRequest):
+    v = database.get_venture(vid)
+    if not v:
+        raise HTTPException(404, "venture not found")
+    name = " ".join(body.name.split())[:80]
+    if not name:
+        raise HTTPException(400, "name required")
+    brief = v.get("brief") or {}
+    brief["name"] = name
+    brief["name_locked"] = True  # a re-drafted brief must not overwrite the founder's choice
+    database.update_venture(vid, name=name, brief=brief)
+    return {"ok": True, "name": name}
+
+
+# The prototype is AI-generated code: it may run JS but must not reach our API or submit anywhere.
+_SANDBOX_CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; "
+                "frame-ancestors 'self'; base-uri 'none'")
+
+
+@app.get("/api/ventures/{vid}/artifacts/{name}")
+def get_artifact(vid: str, name: str):
+    if not database.get_venture(vid) or name not in ARTIFACTS:
+        raise HTTPException(404, "not found")
+    path = (OUTPUTS_DIR / vid / ARTIFACTS[name]).resolve()
+    if OUTPUTS_DIR.resolve() not in path.parents or not path.is_file():
+        raise HTTPException(404, "This file hasn't been generated yet — run the stage first.")
+    if path.suffix == ".md":
+        return FileResponse(path, media_type="text/markdown; charset=utf-8", filename=path.name)
+    headers = {"Content-Security-Policy": _SANDBOX_CSP} if name == "prototype" else {}
+    return FileResponse(path, media_type="text/html; charset=utf-8", headers=headers)
 
 
 @app.get("/api/ventures/{vid}/mindmap")
@@ -236,9 +274,11 @@ def founder_next(body: FounderView):
 def _save_brief(vid, v, brief):
     theme = THEME_BY_CATEGORY.get(brief.get("category", "general"), "indigo")
     old = v.get("brief") or {}
-    for keep in ("field_overrides", "business_map"):
+    for keep in ("field_overrides", "business_map", "name_locked"):
         if old.get(keep):
             brief[keep] = old[keep]
+    if old.get("name_locked"):
+        brief["name"] = v["name"]
     database.update_venture(vid, name=brief.get("name") or v["name"], brief=brief, theme=theme)
     return theme
 

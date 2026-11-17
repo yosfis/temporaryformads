@@ -43,7 +43,7 @@ class OllamaClient:
             )
 
     def chat(self, messages, *, system=None, temperature=OLLAMA_TEMPERATURE,
-             json_mode=False, num_predict=None) -> str:
+             json_mode=False, num_predict=None, timeout=None) -> str:
         if system:
             messages = [{"role": "system", "content": system}, *messages]
         payload: dict[str, Any] = {
@@ -57,7 +57,7 @@ class OllamaClient:
         last_err = None
         for _ in range(OLLAMA_MAX_RETRIES + 1):
             try:
-                r = httpx.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
+                r = httpx.post(f"{self.host}/api/chat", json=payload, timeout=timeout or self.timeout)
                 r.raise_for_status()
                 return r.json()["message"]["content"]
             except Exception as e:
