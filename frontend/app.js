@@ -1042,6 +1042,18 @@ async function renderDecisions() {
   }
 }
 
+// Cytoscape only accepts #rgb/#rrggbb/rgb()/rgba() — never 8-digit hex (that crashed the map).
+function toRgba(color, alpha) {
+  const c = String(color || "").trim();
+  let m = c.match(/^#([0-9a-f]{3})$/i);
+  if (m) return toRgba("#" + m[1].split("").map((x) => x + x).join(""), alpha);
+  m = c.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
+  if (m) return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${alpha})`;
+  m = c.match(/^rgba?\(([^,]+),([^,]+),([^,)]+)/i);
+  if (m) return `rgba(${m[1].trim()},${m[2].trim()},${m[3].trim()},${alpha})`;
+  return `rgba(99,102,241,${alpha})`;
+}
+
 async function renderMindMap() {
   const container = document.getElementById("cy");
   if (!container) return;
@@ -1069,7 +1081,7 @@ async function renderMindMap() {
   const a1 = css.getPropertyValue("--accent").trim() || "#6366f1";
   const a2 = css.getPropertyValue("--accent-2").trim() || "#a855f7";
   const a3 = css.getPropertyValue("--accent-3").trim() || "#06b6d4";
-  state.cy = cytoscape({
+  try { state.cy = cytoscape({
     container, elements: [...data.nodes, ...data.edges], wheelSensitivity: 0.25,
     style: [
       { selector: 'node[type="center"]', style: {
@@ -1077,15 +1089,13 @@ async function renderMindMap() {
         "background-gradient-stop-positions": "0% 50% 100%", "background-gradient-direction": "to-bottom-right",
         label: "data(label)", color: "#fff", "font-weight": 800, "font-size": 19,
         "text-valign": "center", "text-halign": "center", "text-wrap": "wrap", "text-max-width": 170,
-        width: 210, height: 210, padding: 20, "border-width": 3, "border-color": "rgba(255,255,255,.85)",
-        "shadow-blur": 40, "shadow-color": a1, "shadow-opacity": 0.55 }},
+        width: 210, height: 210, padding: 20, "border-width": 3, "border-color": "rgba(255,255,255,.85)" }},
       { selector: 'node[type="aspect"]', style: {
-        "background-fill": "linear-gradient", "background-gradient-stop-colors": `${a2}38 ${a3}38`,
+        "background-fill": "linear-gradient", "background-gradient-stop-colors": `${toRgba(a2, 0.22)} ${toRgba(a3, 0.22)}`,
         "background-gradient-stop-positions": "0% 100%", "background-gradient-direction": "to-bottom-right",
         "border-width": 2, "border-color": a1, label: "data(label)", color: "#f5f5f7",
         "font-weight": 700, "font-size": 13, "text-valign": "center", "text-halign": "center",
-        "text-wrap": "wrap", "text-max-width": 140, width: 170, height: 60, padding: 10,
-        "shadow-blur": 18, "shadow-color": a1, "shadow-opacity": 0.4 }},
+        "text-wrap": "wrap", "text-max-width": 140, width: 170, height: 60, padding: 10 }},
       { selector: 'node[type="aspect"][status="strong"]', style: { "border-color": "#22c55e" }},
       { selector: 'node[type="aspect"][status="gap"]', style: { "border-color": "#f87171", "border-style": "dashed" }},
       { selector: 'node[type="leaf"]', style: {
@@ -1098,7 +1108,10 @@ async function renderMindMap() {
       concentric: (n) => n.data("type") === "center" ? 10 : (n.data("type") === "aspect" ? 5 : 1),
       levelWidth: () => 3, minNodeSpacing: 30, spacingFactor: 1.1, avoidOverlap: true,
       animate: false, padding: 40 },
-  });
+  }); } catch (e) {
+    container.innerHTML = `<div style='padding:32px;color:#fca5a5'>Mind map failed to draw: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
   state.cy.nodes().style({ opacity: 0 });
   state.cy.nodes().forEach((n, i) => setTimeout(() => {
     if (state.cy) n.animate({ style: { opacity: 1 } }, { duration: 380, easing: "ease-out-cubic" });
