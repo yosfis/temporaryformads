@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from backend import approval_manager, mindmap
 from backend.orchestrator import Orchestrator
+from agents.founder_agent import REQUIRED_FIELDS, normalize_state
 from config import FRONTEND_DIR, STAGE_LABELS, STAGES, THEME_BY_CATEGORY
 from memory import database
 from services import decision_log, evidence_ledger
@@ -117,6 +118,20 @@ def get_mindmap(vid: str):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/ventures/{vid}/mindmap/generate")
+async def generate_mindmap(vid: str):
+    """(Re)generate the 12-aspect business map. Only allowed once Discover has run."""
+    if not database.get_venture(vid):
+        raise HTTPException(404, "venture not found")
+    if not mindmap.discover_done(vid):
+        raise HTTPException(409, "Run the Discover stage first — the business map is built from its research.")
+    try:
+        await asyncio.to_thread(orchestrator.build_business_map, vid)
+        return mindmap.build(vid)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
 @app.get("/api/ventures/{vid}/decisions")
 def get_decisions(vid: str):
     v = database.get_venture(vid)
@@ -126,20 +141,10 @@ def get_decisions(vid: str):
 
 
 def _collect_answers(vid):
-    history = database.get_messages(vid)
-    from agents.founder_agent import _assistant_asks_field
-    answers = {}
-    for i, msg in enumerate(history):
-        if msg.get("role") != "assistant":
-            continue
-        field = _assistant_asks_field(msg.get("content", ""))
-        if not field or field in answers:
-            continue
-        if i + 1 < len(history) and history[i + 1].get("role") == "user":
-            answers[field] = history[i + 1].get("content", "").strip()
     v = database.get_venture(vid)
+    answers = dict(normalize_state(v.get("discovery"))["answers"])
     overrides = (v.get("brief") or {}).get("field_overrides") or {}
-    answers.update(overrides)
+    answers.update({k: val for k, val in overrides.items() if val})
     return answers
 
 
@@ -148,10 +153,8 @@ def get_summary(vid: str):
     v = database.get_venture(vid)
     if not v:
         raise HTTPException(404, "venture not found")
-    history = database.get_messages(vid)
-    from agents.founder_agent import _fields_answered
-    return {"idea": v["idea"], "answers": _collect_answers(vid),
-            "answered_fields": sorted(_fields_answered(history))}
+    answers = _collect_answers(vid)
+    return {"idea": v["idea"], "answers": answers, "answered_fields": sorted(answers)}
 
 
 @app.post("/api/ventures/{vid}/analyze-summary")
@@ -159,7 +162,7 @@ def analyze_summary(vid: str):
     v = database.get_venture(vid)
     if not v:
         raise HTTPException(404, "venture not found")
-    answers = _collect_answers(vid)
+    answers = {k: val for k, val in _collect_answers(vid).items() if k in REQUIRED_FIELDS}
     if not answers:
         return {"raw": {}, "analyzed": {}}
     cache_key = vid + "|" + "|".join(f"{k}={val}" for k, val in sorted(answers.items()))
@@ -181,7 +184,9 @@ def ask(vid: str, body: AskRequest):
     if not body.question.strip():
         raise HTTPException(400, "question required")
     try:
-        answer = orchestrator.founder.answer_question(v, body.question.strip(), body.history or [])
+        # No client-side history (e.g. a `?` question mid-interview) → use the stored conversation.
+        history = body.history or database.get_messages(vid)
+        answer = orchestrator.founder.answer_question(v, body.question.strip(), history)
     except Exception as e:
         raise HTTPException(502, str(e))
     return {"answer": answer}
@@ -211,14 +216,18 @@ def founder_next(body: FounderView):
         raise HTTPException(404, "venture not found")
     history = database.get_messages(body.venture_id)
     last = history[-1] if history else None
-    already = (last is not None and last["role"] == "user" and last["content"] == body.message)
-    if not already:
+    # The idea itself is stored as the first user message on venture creation.
+    is_initial = len(history) == 1 and last["role"] == "user" and last["content"] == body.message
+    if not is_initial:
         database.add_message(body.venture_id, "user", body.message)
         history = database.get_messages(body.venture_id)
     try:
-        res = orchestrator.founder.next_question(v["idea"], history)
+        res = orchestrator.founder.next_question(
+            v["idea"], history, v.get("discovery"),
+            new_message=None if is_initial else body.message)
     except Exception as e:
         raise HTTPException(502, str(e))
+    database.update_venture(body.venture_id, discovery=res.pop("state"))
     if res["question"]:
         database.add_message(body.venture_id, "assistant", res["question"])
     return res
@@ -226,9 +235,10 @@ def founder_next(body: FounderView):
 
 def _save_brief(vid, v, brief):
     theme = THEME_BY_CATEGORY.get(brief.get("category", "general"), "indigo")
-    existing = (v.get("brief") or {}).get("field_overrides") or {}
-    if existing:
-        brief["field_overrides"] = existing
+    old = v.get("brief") or {}
+    for keep in ("field_overrides", "business_map"):
+        if old.get(keep):
+            brief[keep] = old[keep]
     database.update_venture(vid, name=brief.get("name") or v["name"], brief=brief, theme=theme)
     return theme
 
@@ -240,7 +250,7 @@ def founder_brief(body: FounderView):
         raise HTTPException(404, "venture not found")
     history = database.get_messages(body.venture_id)
     try:
-        brief = orchestrator.founder.draft_brief(v["idea"], history)
+        brief = orchestrator.founder.draft_brief(v["idea"], history, _collect_answers(v["id"]))
     except Exception as e:
         raise HTTPException(502, str(e))
     theme = _save_brief(body.venture_id, v, brief)
@@ -254,7 +264,7 @@ def redraft_brief(vid: str):
         raise HTTPException(404, "venture not found")
     history = database.get_messages(vid)
     try:
-        brief = orchestrator.founder.draft_brief(v["idea"], history)
+        brief = orchestrator.founder.draft_brief(v["idea"], history, _collect_answers(v["id"]))
     except Exception as e:
         raise HTTPException(502, str(e))
     theme = _save_brief(vid, v, brief)

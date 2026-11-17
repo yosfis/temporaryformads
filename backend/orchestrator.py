@@ -4,6 +4,7 @@ import json
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from agents.business_map_agent import BusinessMapAgent
 from agents.case_research_agent import CaseResearchAgent
 from agents.commercial_agent import CommercialAgent
 from agents.development_agent import DevelopmentAgent
@@ -71,6 +72,20 @@ class Orchestrator:
         self.marketing = MarketingAgent()
         self.operations = OperationsAgent()
         self.case_research = CaseResearchAgent()
+        self.business_map = BusinessMapAgent()
+
+    def build_business_map(self, vid, feasibility=None):
+        """Generate the 12-aspect business map and store it on the brief."""
+        v = database.get_venture(vid)
+        if not v:
+            raise ValueError("unknown venture")
+        bmap = self.business_map.generate(v, feasibility=feasibility)
+        bmap["generated_at"] = utcnow()
+        fresh = database.get_venture(vid)  # re-read so concurrent brief edits aren't clobbered
+        brief = fresh.get("brief") or {}
+        brief["business_map"] = bmap
+        database.update_venture(vid, brief=brief)
+        return bmap
 
     def run_discover(self, vid):
         v = database.get_venture(vid)
@@ -137,6 +152,14 @@ class Orchestrator:
                 {"question": q, "findings": len(r.get("findings", [])), "sources": len(r.get("sources", []))}
                 for q, r in zip(questions, research_results)],
         }
+
+        _checkpoint(vid, "discover", "Building business map (12 core aspects)…")
+        try:
+            bmap = self.build_business_map(vid, feasibility=feas)
+            gaps = sum(1 for a in bmap["aspects"] if a["status"] == "gap")
+            _checkpoint(vid, "discover", f"Business map ready — {len(bmap['aspects'])} aspects, {gaps} gaps")
+        except Exception as e:
+            _checkpoint(vid, "discover", f"Business map failed — {str(e)[:80]}")
 
         if gate == "STOP":
             StateManager.set_stage(vid, "discover", "stopped")

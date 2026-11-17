@@ -56,6 +56,11 @@ def init_db():
             c.execute("ALTER TABLE decisions ADD COLUMN model TEXT")
         except sqlite3.OperationalError:
             pass
+        # Idempotent migration: structured founder-interview state
+        try:
+            c.execute("ALTER TABLE ventures ADD COLUMN discovery_json TEXT NOT NULL DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
 
 def create_venture(name, idea, theme="indigo"):
     vid = str(uuid.uuid4()); now = utcnow()
@@ -77,6 +82,7 @@ def get_venture(vid):
         return None
     v = dict(row)
     v["brief"] = json.loads(v.pop("brief_json") or "{}")
+    v["discovery"] = json.loads(v.pop("discovery_json", None) or "{}")
     return v
 
 def list_ventures():
@@ -91,6 +97,8 @@ def update_venture(vid, **fields):
         return
     if "brief" in fields:
         fields["brief_json"] = json.dumps(fields.pop("brief"))
+    if "discovery" in fields:
+        fields["discovery_json"] = json.dumps(fields.pop("discovery"))
     fields["updated_at"] = utcnow()
     sets = ", ".join(f"{k}=?" for k in fields)
     with connect() as c:

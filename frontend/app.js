@@ -1,7 +1,7 @@
 const state = { ventureId: null, modelReady: false, config: null,
                 cy: null, pollTimer: null, readyForBrief: false,
                 etaTimer: null, etaStart: 0, etaTotal: 0,
-                analyzedCache: null };
+                analyzedCache: null, askHistory: [] };
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 const STORAGE_KEY = "ventureos.state.v1";
@@ -24,6 +24,7 @@ function clearState() {
   try { localStorage.removeItem(STORAGE_KEY); } catch {}
   state.ventureId = null;
   state.analyzedCache = null;
+  state.askHistory = [];
 }
 
 /* ── Start over ──────────────────────────────────────────────────── */
@@ -385,7 +386,8 @@ async function showSummaryConfirm() {
     if (analyzed) state.analyzedCache = analyzed;
   } catch {}
 
-  const fields = { budget: "Budget", skills: "Skills", education: "Education", target_market: "Target market" };
+  const fields = { problem: "Problem", differentiation: "Unique angle", target_market: "Target market",
+                   budget: "Budget", skills: "Skills", education: "Education" };
   const rows = Object.entries(fields).map(([k, lbl]) => {
     const raw = (summary.answers || {})[k];
     const pretty = analyzed && analyzed[k] && String(analyzed[k]).trim() ? String(analyzed[k]).trim() : null;
@@ -511,10 +513,11 @@ async function sendAsk() {
   try {
     const res = await api(`/api/ventures/${state.ventureId}/ask`, {
       method: "POST",
-      body: JSON.stringify({ question: q, history: [] })
+      body: JSON.stringify({ question: q, history: state.askHistory.slice(-10) })
     });
     pending.remove();
     appendAskMsg(log, "assistant", res.answer);
+    state.askHistory.push({ role: "user", content: q }, { role: "assistant", content: res.answer });
   } catch (e) {
     pending.remove();
     appendAskMsg(log, "assistant", "⚠️ " + e.message);
@@ -974,6 +977,20 @@ async function renderMindMap() {
   try { data = await api(`/api/ventures/${state.ventureId}/mindmap`); }
   catch (e) { container.innerHTML = `<div style='padding:32px;color:#fca5a5'>Error: ${escapeHtml(e.message)}</div>`; return; }
   if (state.cy) { state.cy.destroy(); state.cy = null; }
+  if (data.pending) {
+    container.innerHTML = `<div style="padding:32px;color:var(--muted);line-height:1.6;max-width:520px">
+      ${escapeHtml(data.message || "Business map not generated yet.")}
+      ${data.can_generate ? '<div style="margin-top:14px"><button class="primary" id="gen-map">Generate business map</button></div>' : ""}
+    </div>`;
+    const gb = document.getElementById("gen-map");
+    if (gb) gb.onclick = async () => {
+      gb.disabled = true; gb.textContent = "Generating…";
+      try { await api(`/api/ventures/${state.ventureId}/mindmap/generate`, { method: "POST" }); await renderMindMap(); }
+      catch (e) { toastError("Map failed: " + e.message); gb.disabled = false; gb.textContent = "Generate business map"; }
+    };
+    return;
+  }
+  container.innerHTML = "";
   const css = getComputedStyle(document.documentElement);
   const a1 = css.getPropertyValue("--accent").trim() || "#6366f1";
   const a2 = css.getPropertyValue("--accent-2").trim() || "#a855f7";
@@ -995,6 +1012,8 @@ async function renderMindMap() {
         "font-weight": 700, "font-size": 13, "text-valign": "center", "text-halign": "center",
         "text-wrap": "wrap", "text-max-width": 140, width: 170, height: 60, padding: 10,
         "shadow-blur": 18, "shadow-color": a1, "shadow-opacity": 0.4 }},
+      { selector: 'node[type="aspect"][status="strong"]', style: { "border-color": "#22c55e" }},
+      { selector: 'node[type="aspect"][status="gap"]', style: { "border-color": "#f87171", "border-style": "dashed" }},
       { selector: 'node[type="leaf"]', style: {
         "background-color": "rgba(255,255,255,.055)", "border-width": 1, "border-color": "rgba(255,255,255,.14)",
         label: "data(label)", color: "#c8c8d8", "font-size": 11, "text-wrap": "wrap", "text-max-width": 130,
@@ -1012,9 +1031,14 @@ async function renderMindMap() {
   }, 80 + i * 25));
   setTimeout(() => { if (state.cy) state.cy.fit(undefined, 50); }, 1200);
   state.cy.on("tap", 'node[type="center"]', (e) => showModal(e.target.data("items") || [], "Actionable Steps"));
+  const statusText = { strong: "Backed by evidence", partial: "Stated, not yet verified", gap: "Gap — needs work" };
   state.cy.on("tap", 'node[type="aspect"]', (e) => {
-    const items = e.target.connectedEdges().targets().filter((n) => n.data("type") === "leaf").map((n) => String(n.data("label") || ""));
-    showModal(items, e.target.data("label"));
+    const d = e.target.data();
+    showModal([...(d.items || []), statusText[d.status] ? `Status: ${statusText[d.status]}` : ""].filter(Boolean), d.full_label || d.label);
+  });
+  state.cy.on("tap", 'node[type="leaf"]', (e) => {
+    const parent = e.target.incomers("node")[0];
+    showModal([e.target.data("full") || e.target.data("label")], parent ? (parent.data("full_label") || parent.data("label")) : "Detail");
   });
 }
 
